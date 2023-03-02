@@ -55,7 +55,7 @@ class DiffusionDataset(Dataset):
         
         img = img.astype('float32')
         img = img / 255 * 2 - 1  # 归一化到[-1,1]之间
-        
+        img = img.transpose(2, 0, 1)
         return img
 
     def __len__(self,):
@@ -65,16 +65,24 @@ class DiffusionDataset(Dataset):
 class ResidualBlock(nn.Module):
     def __init__(self, in_ch, out_ch, embedding_size) -> None:
         super().__init__()
+        self.in_ch = in_ch
+        self.out_ch = out_ch
         act = Swish(out_ch)
         
         self.conv1 = nn.Conv2d(embedding_size, in_ch, 1)
+        if in_ch != out_ch:
+            self.conv_res = nn.Conv2d(in_ch, out_ch, 1) 
         self.conv2 = nn.Sequential(nn.Conv2d(in_ch, out_ch, 3, padding=1), act)
-        self.conv3 = nn.Sequential(nn.Conv2d(in_ch, out_ch, 3, padding=1), act)
+        self.conv3 = nn.Sequential(nn.Conv2d(out_ch, out_ch, 3, padding=1), act)
         
-        self.group_norm = nn.GroupNorm()
+        self.group_norm = nn.GroupNorm(32, out_ch)
     
     def forward(self, x, t):
-        res = x 
+        if self.in_ch != self.out_ch:
+            res = self.conv_res(x)
+        else:
+            res = x
+            
         x += self.conv1(t)
         x = self.conv2(x)
         x = self.conv3(x)
@@ -92,8 +100,8 @@ class ToyDiffusionModel(nn.Module):
         self.conv_out = nn.Conv2d(embedding_size, 3, kernel_size=3, padding=1)
          
         self.avg_pooling = nn.AvgPool2d(2)
-        self.upsample = nn.Upsample(2)
-        self.group_norm = nn.GroupNorm()
+        self.upsample = nn.Upsample(scale_factor=2)
+        self.group_norm = nn.GroupNorm(32, embedding_size)
         
         self.residual_block1 = ResidualBlock(embedding_size, embedding_size, embedding_size)
         self.residual_block2 = ResidualBlock(embedding_size, embedding_size, embedding_size)
@@ -112,10 +120,10 @@ class ToyDiffusionModel(nn.Module):
         self.residual_block6_de = ResidualBlock(embedding_size * 4, embedding_size * 4, embedding_size)
     
     def forward(self, x, t):
-        x = self.conv_in(x)
-        embedding_t = self.embedding_t(t)
+        x = self.conv_in(x)                                     # [64, 128, 128, 128]
+        embedding_t = self.embedding_t(t)[:, :, None, None]     # [64, 128]
         #TODO  这里为啥每一层都要加 embedding_t 
-        x1 = self.residual_block1(x, embedding_t)
+        x1 = self.residual_block1(x, embedding_t) 
         x1 = self.avg_pooling(x1)
         
         x2 = self.residual_block2(x1, embedding_t)
@@ -135,23 +143,23 @@ class ToyDiffusionModel(nn.Module):
         
         x_bottom = self.residual_block_bottom(x6, embedding_t)
         
-        x6_de = self.upsample(x_bottom)
-        x6_de = self.residual_block6_de(x6_de+x6, embedding_t)
-
+        x6_de = self.residual_block6_de(x_bottom+x6, embedding_t)
         x5_de = self.upsample(x6_de)
-        x5_de = self.residual_block6_de(x5_de+x5, embedding_t)
 
+        x5_de = self.residual_block5_de(x5_de+x5, embedding_t)
         x4_de = self.upsample(x5_de)
-        x4_de = self.residual_block6_de(x4_de+x4, embedding_t)
 
-        x3_de = self.upsample(x3_de)
-        x3_de = self.residual_block6_de(x3_de+x3, embedding_t)
+        x4_de = self.residual_block4_de(x4_de+x4, embedding_t)
+        x3_de = self.upsample(x4_de)
 
-        x2_de = self.upsample(x2_de)
-        x2_de = self.residual_block6_de(x2_de+x2, embedding_t)
+        x3_de = self.residual_block3_de(x3_de+x3, embedding_t)
+        x2_de = self.upsample(x3_de)
 
+        x2_de = self.residual_block2_de(x2_de+x2, embedding_t)
+        x1_de = self.upsample(x2_de)
+
+        x1_de = self.residual_block1_de(x1_de+x1, embedding_t)
         x1_de = self.upsample(x1_de)
-        x1_de = self.residual_block6_de(x1_de+x1, embedding_t)
         
         x_out = self.group_norm(x1_de)
         x_out = self.conv_out(x_out)
@@ -159,12 +167,12 @@ class ToyDiffusionModel(nn.Module):
         return x_out
 
 def l2_loss(y_true, y_pred):
-    return torch.sum((y_true - y_pred) ** 2, dim=[1,2,3])
+    return torch.sum((y_true - y_pred) ** 2)
 
 
 def train():
     max_epochs = 100000
-    img_path = ""
+    img_path = "/root/autodl-nas/yuyan/data/celeba_hq/train"
     img_size = 128
     batch_size = 64  # 如果显存不够，可以降低为32、16，但不建议低于16
     embedding_size = 128
@@ -177,13 +185,14 @@ def train():
     bar_beta = np.sqrt(1 - bar_alpha ** 2) 
     sigma = beta.copy()
     
-    
     dataset = DiffusionDataset(img_path, img_size=img_size)
     data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=8)
     model = ToyDiffusionModel(embedding_size=embedding_size)
+    model.cuda()
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     
     for epoch in range(max_epochs):
+        model.train()
         for data in data_loader:
             
             batch_imgs = data 
@@ -193,10 +202,18 @@ def train():
             batch_noise = np.random.randn(*batch_imgs.shape)
             batch_noisy_imgs = batch_imgs * batch_bar_alpha + batch_noise * batch_bar_beta 
             
+            batch_noisy_imgs = batch_noisy_imgs.float().cuda()
+            batch_noise = torch.from_numpy(batch_noise).float().cuda()
+            batch_steps = torch.from_numpy(batch_steps).cuda()
+            
             optimizer.zero_grad()
             
-            pred_noise = model(batch_noisy_imgs)
+            pred_noise = model(batch_noisy_imgs, batch_steps)
             loss = l2_loss(pred_noise, batch_noise)
             loss.backward()
             
-        
+            print(f"#epoch: {epoch}, loss: {loss}")
+
+
+if __name__ == "__main__":
+    train()
