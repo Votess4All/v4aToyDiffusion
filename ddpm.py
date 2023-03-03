@@ -6,7 +6,22 @@ import glob
 import os
 import cv2
 import numpy as np
+from tqdm import tqdm
 
+
+max_epochs = 100000
+img_path = "/root/autodl-nas/yuyan/data/celeba_hq/train"
+img_size = 128
+batch_size = 48  # 如果显存不够，可以降低为32、16，但不建议低于16
+embedding_size = 128
+learning_rate = 1e-3
+
+T = 1000
+alpha = np.sqrt(1 - 0.02 * np.arange(1, T+1) / T)
+beta = np.sqrt(1 - alpha ** 2)
+bar_alpha = np.cumprod(alpha)
+bar_beta = np.sqrt(1 - bar_alpha ** 2) 
+sigma = beta.copy()
 
 class Swish(nn.Module):
     """
@@ -63,30 +78,29 @@ class DiffusionDataset(Dataset):
 
 
 class ResidualBlock(nn.Module):
-    def __init__(self, in_ch, out_ch, embedding_size) -> None:
+    def __init__(self, in_ch, out_ch=None, embedding_size=None) -> None:
         super().__init__()
         self.in_ch = in_ch
-        self.out_ch = out_ch
-        act = Swish(out_ch)
+        self.out_ch = out_ch if out_ch else in_ch
         
-        self.conv1 = nn.Conv2d(embedding_size, in_ch, 1)
-        if in_ch != out_ch:
-            self.conv_res = nn.Conv2d(in_ch, out_ch, 1) 
-        self.conv2 = nn.Sequential(nn.Conv2d(in_ch, out_ch, 3, padding=1), act)
-        self.conv3 = nn.Sequential(nn.Conv2d(out_ch, out_ch, 3, padding=1), act)
+        if self.in_ch == self.out_ch:
+            self.skip_conv = nn.Identity()
+        else:
+            self.skip_conv = nn.Conv2d(in_ch, out_ch, 1)
+        
+        self.conv_t = nn.Conv2d(embedding_size, out_ch, 1)
+        self.conv1 = nn.Sequential(nn.Conv2d(in_ch, out_ch, 3, padding=1), Swish(out_ch))
+        self.conv2 = nn.Sequential(nn.Conv2d(out_ch, out_ch, 3, padding=1), Swish(out_ch))
         
         self.group_norm = nn.GroupNorm(32, out_ch)
     
     def forward(self, x, t):
-        if self.in_ch != self.out_ch:
-            res = self.conv_res(x)
-        else:
-            res = x
-            
-        x += self.conv1(t)
+        res = x
+        x = self.conv1(x)
+        x += self.conv_t(t)
         x = self.conv2(x)
-        x = self.conv3(x)
-        x += res 
+        
+        x = x + self.skip_conv(res)
         x = self.group_norm(x)
         
         return x
@@ -167,33 +181,90 @@ class ToyDiffusionModel(nn.Module):
         return x_out
 
 def l2_loss(y_true, y_pred):
-    return torch.sum((y_true - y_pred) ** 2)
+    return torch.sum((y_true - y_pred) ** 2, dim=[1,2,3])
 
+
+def imwrite(path, figure):
+    """归一化到了[-1, 1]的图片矩阵保存为图片
+    """
+    figure = (figure + 1) / 2 * 255
+    figure = np.round(figure, 0).astype('uint8')
+    cv2.imwrite(path, figure)
+    
+
+def sample(path=None, n=4, z_samples=None, t0=0, model=None):
+    """随机采样函数
+    """
+    if z_samples is None:
+        z_samples = np.random.randn(n**2, 3, img_size, img_size)
+    else:
+        z_samples = z_samples.copy()
+    for t in tqdm(range(t0, T), ncols=0):
+        # 从[x_{T}, x_{T-1}, ..., x0]恢复
+        t = T - t - 1
+        # 每次推理 z_samples.shape[0] 个样本，这里就是16个
+        bt = np.array([t] * z_samples.shape[0])
+        z_samples_tensor = torch.from_numpy(z_samples).float().cuda()
+        bt_tensor = torch.from_numpy(bt).cuda()
+        
+        out = model(z_samples_tensor, bt_tensor)
+        out = out.detach().cpu().numpy()
+        
+        z_samples -= beta[t]**2 / bar_beta[t] * out
+        z_samples /= alpha[t]
+        z_samples += np.random.randn(*z_samples.shape) * sigma[t]
+    x_samples = np.clip(z_samples, -1, 1)
+    
+    x_samples = x_samples.transpose(0, 2, 3, 1)
+    if path is None:
+        return x_samples
+    figure = np.zeros((img_size * n, img_size * n, 3))
+    for i in range(n):
+        for j in range(n):
+            digit = x_samples[i * n + j]
+            figure[i * img_size:(i + 1) * img_size,
+                   j * img_size:(j + 1) * img_size] = digit
+    imwrite(path, figure)
+    
+def save_model(dirname, model, optimizer, epoch, step, loss):
+    
+    ckpt = {
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict() if optimizer is not None else None,
+        "epoch": epoch,
+        "step": step,
+        "loss": loss,
+    }
+    
+    path = os.path.join(dirname, f"ddpm_epoch{epoch}_step{step}_loss{loss}.pth")
+    torch.save(ckpt, path)
+    
+def load_model(path, model, optimizer, epoch, step, loss, map_location="cpu"):
+    ckpt = torch.load(path, map_location=map_location)
+    assert isinstance(ckpt, dict)
+    
+    model.load_state_dict(ckpt["model"])
+    if optimizer and ckpt["optimizer"]:
+        optimizer.load_state_dict(ckpt["optimizer"])
+    epoch = ckpt["epoch"] if "epoch" in ckpt else 0
+    step = ckpt["step"] if "step" in ckpt else 0
+    loss = ckpt["loss"] if "loss" in ckpt else float("inf")
+    return epoch, step, loss 
 
 def train():
-    max_epochs = 100000
-    img_path = "/root/autodl-nas/yuyan/data/celeba_hq/train"
-    img_size = 128
-    batch_size = 64  # 如果显存不够，可以降低为32、16，但不建议低于16
-    embedding_size = 128
-    learning_rate = 1e-3
-    
-    T = 1000
-    alpha = np.sqrt(1 - 0.02 * np.arange(1, T+1) / T)
-    beta = np.sqrt(1 - alpha ** 2)
-    bar_alpha = np.cumprod(alpha)
-    bar_beta = np.sqrt(1 - bar_alpha ** 2) 
-    sigma = beta.copy()
+    # torch.autograd.set_detect_anomaly(True)
+    os.makedirs("samples", exist_ok=True)
+    os.makedirs("ckpt", exist_ok=True)
     
     dataset = DiffusionDataset(img_path, img_size=img_size)
-    data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=8)
+    data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=24, drop_last=True)
     model = ToyDiffusionModel(embedding_size=embedding_size)
     model.cuda()
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     
     for epoch in range(max_epochs):
         model.train()
-        for data in data_loader:
+        for iter, data in enumerate(data_loader):
             
             batch_imgs = data 
             batch_steps = np.random.choice(T, batch_size)
@@ -209,11 +280,17 @@ def train():
             optimizer.zero_grad()
             
             pred_noise = model(batch_noisy_imgs, batch_steps)
-            loss = l2_loss(pred_noise, batch_noise)
+            loss = torch.mean(l2_loss(pred_noise, batch_noise))
             loss.backward()
+            optimizer.step()
             
-            print(f"#epoch: {epoch}, loss: {loss}")
+            if iter % 20 == 0:
+                print(f"#epoch: {epoch}, #iter: {iter}, loss: {loss}")
 
+        model.eval()
+        sample('samples/%05d.png' % (epoch + 1), model=model)
+        save_model("ckpt", model, optimizer, epoch, iter, loss)
+        model.train()
 
 if __name__ == "__main__":
     train()
