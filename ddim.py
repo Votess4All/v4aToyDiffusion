@@ -22,10 +22,12 @@ device = "cuda:0"
 
 
 class DiffusionProgress:
-    def __init__(self, T=1000, beta_start=1e-4, beta_end=0.02, img_size=128, device="cpu") -> None:
+    def __init__(self, T=1000, beta_start=1e-4, beta_end=0.02, stride=1, eta=1, img_size=128, device="cpu") -> None:
         self.noise_steps = T
         self.beta_start = beta_start
         self.beta_end = beta_end
+        self.stride = stride
+        self.eta = eta
         self.img_size = img_size
         self.device = device
         
@@ -46,25 +48,35 @@ class DiffusionProgress:
         return sqrt_alpha_hat * x + sqrt_one_minus_alpha_hat * noise, noise
 
     def sample(self, n=4, model=None):
+
+        self.sample_beta = self.prepare_noise_schedule()[::self.stride].to(device)
+        self.sample_alpha = 1. - self.sample_beta
+        self.sample_alpha_hat = torch.cumprod(self.sample_alpha, dim=0)
+        
+        self.sample_beta_hat = torch.sqrt(1 - self.sample_alpha_hat)
+        self.sample_alpha_hat_pre = torch.concat([torch.tensor([1]).to(device), self.sample_alpha_hat[:-1,]], dim=0)
+        self.sample_beta_hat_pre = torch.sqrt(1 - self.sample_alpha_hat_pre)
+        self.sample_alpha_ = self.sample_alpha_hat / self.sample_alpha_hat_pre
+        self.sample_sigma_ = self.sample_beta_hat_pre / self.sample_beta_hat * torch.sqrt(1 - self.sample_alpha_**2) * self.eta
+        self.sample_epsilon_ = self.sample_beta_hat - self.sample_alpha_ * torch.sqrt(self.sample_beta_hat_pre**2 - self.sample_sigma_**2)
+        self.sample_noise_steps_ = len(self.sample_beta)
+        
         model.eval()
         with torch.no_grad():
             x = torch.randn(n, 3, self.img_size, self.img_size).to(self.device)
-            for i in tqdm(reversed(range(1, self.noise_steps)), position=0):
+            for i in tqdm(reversed(range(1, self.sample_noise_steps_)), position=0):
                 
                 t = (torch.ones(n) * i).long().to(self.device)
-                pred_noise = model(x, t)
+                pred_noise = model(x, t * self.stride)
                 
-                if i > 1:
-                    noise = torch.randn_like(x)
-                else:
-                    noise = torch.zeros_like(x)
+                noise = torch.randn_like(x)
                 
-                _alpha = self.alpha[t][:, None, None, None]
-                _alpha_hat = self.alpha_hat[t][:, None, None, None]
-                _beta = self.beta[t][:, None, None, None]
+                _alpha = self.sample_alpha_[t][:, None, None, None]
+                _epsilon = self.sample_epsilon_[t][:, None, None, None]
+                _sigma = self.sample_sigma_[t][:, None, None, None]
 
-                x = 1 / torch.sqrt(_alpha) * (x - ((1 - _alpha) / (torch.sqrt(1 - _alpha_hat))) * pred_noise) + torch.sqrt(_beta) * noise
-            
+                x = 1 / _alpha * (x - _epsilon * pred_noise) + _sigma * noise
+                
         model.train()  
         x = (x.clamp(-1, 1) + 1) / 2
         x = (x * 255).type(torch.uint8)
@@ -73,7 +85,7 @@ class DiffusionProgress:
 def train():
     # torch.autograd.set_detect_anomaly(True)
     sample_dir = "samples"
-    ckpt_dir = "/home/save_ckpt/ddpm/"
+    ckpt_dir = "/home/save_ckpt/ddim/"
     os.makedirs(sample_dir, exist_ok=True)
     os.makedirs(ckpt_dir, exist_ok=True)
     
@@ -81,11 +93,11 @@ def train():
     
     dataset = DiffusionDataset(img_path, img_size=img_size)
     data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=20, drop_last=True)
-    progress = DiffusionProgress(img_size=img_size, device=device)
+    progress = DiffusionProgress(img_size=img_size, device=device, eta=0, stride=100)
     # model = NaiveUnet(3, 3, 128)
     # model = UNet()
     # model = ToyDiffusionModel(device=device) 
-    model = UNet() 
+    model = UNet(device=device) 
     model = model.to(device)
     
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
